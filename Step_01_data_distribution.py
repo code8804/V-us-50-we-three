@@ -13,7 +13,7 @@ Step_01_data_distribution.py
 2. 从原始训练集划出全局测试集和客户端数据池；
 3. 根据客户端数量、标签异构参数和数据量异构参数，为每个客户端分配本地数据；
 4. 保证同一客户端内部 train/test 不重叠；
-5. 保证同一客户端的 train/test 使用相同的标签集合，但标签比例可以不同；
+5. 保证同一客户端的 train/test 来自同一标签分布，并尽可能保持标签比例一致；
 6. 允许不同客户端之间持有相同样本（“复制”而不是从公共池中永久拿走）；
 7. 通过 seed 控制整套随机分发过程，保证实验可复现；
 8. 输出客户端实际持有的数据索引，以及 client_sizes 等后续模块所需元信息。
@@ -267,7 +267,7 @@ class FLDataDistributor:
             - global test / client data pool 的随机划分；
             - 每个客户端的标签偏好生成；
             - 不同标签下具体样本的随机抽取；
-            - train/test 的标签比例随机生成。
+            - 客户端标签偏好生成，以及同一分布下的 train/test 随机抽样。
             相同配置 + 相同 seed => 尽量得到完全相同的数据分发结果；
             修改 seed => 生成另一套随机数据分布。
         """
@@ -646,146 +646,160 @@ class FLDataDistributor:
         """
         为单个客户端复制样本。
 
-        核心规则：
-        1. 不同客户端之间允许使用同一原始样本；
-        2. 同一客户端内部 train 和 local test 严格互斥；
-        3. 同一客户端的 train/test 使用相同的标签集合；
-        4. train/test 的标签比例不要求相同；
-        5. 如果 train 或 test 的样本量小于标签种类数，
-           则数学上无法保证全部标签都出现，此时只能尽量覆盖。
-
-        参数
-        ----------
-        total_size:
-            该客户端理论总样本数。
-
-        train_label_probs:
-            该客户端训练集所使用的标签偏好概率。
-            其中非零位置决定该客户端允许拥有的标签集合。
-
-        label_to_pool_indices:
-            公共数据池中的“标签 -> 样本索引列表”映射。
+        修正版核心规则：
+        1. 不同客户端之间仍允许复用同一原始样本；
+        2. 同一客户端内部 train / local test 严格不重叠；
+        3. train / test 不再分别生成两套 Dirichlet 比例；
+        4. 先按客户端唯一的 label preference 构造本地总数据，
+           再在各标签内部切分 train / test，因此两者分布尽量一致；
+        5. 某标签容量不足时，将缺额重新分配到该客户端允许的其他标签；
+           若所有允许标签的总容量仍不足，则自动缩小该客户端实际数据量。
         """
         if total_size <= 0:
             return [], []
 
-        local_test_size = int(total_size * self.local_test_ratio)
-        train_size = total_size - local_test_size
-
-        # 如果启用了 local test，且客户端至少有两个样本，则尽量保证 train/test 都非空。
-        if self.local_test_ratio > 0 and total_size >= 2:
-            local_test_size = max(1, local_test_size)
-            train_size = total_size - local_test_size
-
-            if train_size == 0:
-                train_size = 1
-                local_test_size = total_size - 1
-
-        # train/test 必须共享同一个标签集合。
         active_labels = np.where(train_label_probs > 0)[0].tolist()
+        if not active_labels:
+            return [], []
 
-        # 测试集重新生成独立比例：
-        # 标签集合与 train 一样，但各标签比例可以完全不同。
-        test_label_probs = self._generate_independent_probs_for_labels(
-            active_labels
-        )
+        capacities = np.zeros_like(train_label_probs, dtype=int)
+        for label in active_labels:
+            capacities[label] = len(label_to_pool_indices.get(label, []))
 
-        # 分别生成 train / test 的各标签样本额度。
-        # 如果样本数足够，则保证 active_labels 中每个标签至少出现一次。
-        train_label_counts = self._integer_allocation_with_coverage(
-            train_size,
+        total_capacity = int(capacities[active_labels].sum())
+        if total_capacity <= 0:
+            return [], []
+
+        actual_total = min(int(total_size), total_capacity)
+
+        requested = self._integer_allocation(
+            actual_total,
             train_label_probs,
-            active_labels,
         )
-        test_label_counts = self._integer_allocation_with_coverage(
-            local_test_size,
-            test_label_probs,
-            active_labels,
+        local_counts = np.minimum(requested, capacities)
+        missing = actual_total - int(local_counts.sum())
+
+        # 容量不足时，把缺额重新分配给仍有余量的允许标签。
+        while missing > 0:
+            spare_labels = [
+                label for label in active_labels
+                if local_counts[label] < capacities[label]
+            ]
+            if not spare_labels:
+                break
+
+            spare_probs = np.asarray(
+                [train_label_probs[label] for label in spare_labels],
+                dtype=float,
+            )
+            if float(spare_probs.sum()) <= 0:
+                spare_probs = np.ones(len(spare_labels), dtype=float)
+            spare_probs /= spare_probs.sum()
+
+            extra = self._integer_allocation(missing, spare_probs)
+            moved = 0
+
+            for pos, label in enumerate(spare_labels):
+                room = int(capacities[label] - local_counts[label])
+                add = min(int(extra[pos]), room)
+                if add > 0:
+                    local_counts[label] += add
+                    moved += add
+
+            if moved == 0:
+                # 防止极端整数取整情形下无法推进。
+                for label in spare_labels:
+                    if missing <= 0:
+                        break
+                    if local_counts[label] < capacities[label]:
+                        local_counts[label] += 1
+                        moved += 1
+                        missing -= 1
+                if moved == 0:
+                    break
+            else:
+                missing -= moved
+
+        actual_total = int(local_counts.sum())
+        if actual_total <= 0:
+            return [], []
+
+        local_test_size = int(round(actual_total * self.local_test_ratio))
+        if self.local_test_ratio > 0 and actual_total >= 2:
+            local_test_size = max(
+                1,
+                min(local_test_size, actual_total - 1),
+            )
+        else:
+            local_test_size = max(
+                0,
+                min(local_test_size, actual_total),
+            )
+
+        # 在已经确定的“本地总标签计数”内部切分 test。
+        # 这样 train/test 继承同一个客户端分布。
+        ideal_test = (
+            local_counts.astype(float)
+            * (local_test_size / actual_total)
+            if actual_total > 0
+            else np.zeros_like(local_counts, dtype=float)
         )
+        test_counts = np.floor(ideal_test).astype(int)
+        test_counts = np.minimum(test_counts, local_counts)
+
+        remainder = local_test_size - int(test_counts.sum())
+        if remainder > 0:
+            order = sorted(
+                active_labels,
+                key=lambda label: (
+                    ideal_test[label] - test_counts[label],
+                    train_label_probs[label],
+                ),
+                reverse=True,
+            )
+            while remainder > 0:
+                progressed = False
+                for label in order:
+                    if remainder <= 0:
+                        break
+                    if test_counts[label] < local_counts[label]:
+                        test_counts[label] += 1
+                        remainder -= 1
+                        progressed = True
+                if not progressed:
+                    break
 
         selected_train: List[int] = []
         selected_test: List[int] = []
 
-        # 只记录“当前客户端”已经使用过的样本。
-        #
-        # 因此：
-        # - Client A 用过的样本，Client B 依然可以再次使用；
-        # - 但 Client A 自己的 train/test 不允许重复使用同一个样本。
-        used_by_this_client = set()
+        # 每个标签只抽一次，再内部切 train/test，天然避免重叠。
+        for label in active_labels:
+            total_needed = int(local_counts[label])
+            if total_needed <= 0:
+                continue
 
-        def draw_samples(
-            requested_counts: np.ndarray,
-            target_list: List[int],
-        ) -> None:
-            """
-            根据每个标签所需的样本数，从公共池中抽取实际样本。
+            candidates = list(label_to_pool_indices.get(label, []))
+            total_needed = min(total_needed, len(candidates))
 
-            注意：
-            这里不会从全局公共池中删除样本，
-            因此天然支持不同客户端之间的数据重复。
-            """
-            for label, requested in enumerate(requested_counts):
-                if requested <= 0:
-                    continue
+            chosen = self.py_rng.sample(candidates, total_needed)
+            self.py_rng.shuffle(chosen)
 
-                candidates = [
-                    idx
-                    for idx in label_to_pool_indices[label]
-                    if idx not in used_by_this_client
-                ]
+            n_test = min(int(test_counts[label]), len(chosen))
+            selected_test.extend(chosen[:n_test])
+            selected_train.extend(chosen[n_test:])
 
-                take = min(int(requested), len(candidates))
-                if take <= 0:
-                    continue
+        self.py_rng.shuffle(selected_train)
+        self.py_rng.shuffle(selected_test)
 
-                chosen = self.py_rng.sample(candidates, take)
+        if set(selected_train) & set(selected_test):
+            raise RuntimeError(
+                "内部错误：同一客户端 train/test 出现样本重叠"
+            )
 
-                target_list.extend(chosen)
-                used_by_this_client.update(chosen)
-
-        # 先抽训练集，再抽本地测试集。
-        draw_samples(train_label_counts, selected_train)
-        draw_samples(test_label_counts, selected_test)
-
-        # ============================================================
-        # 样本不足时的工程性补齐
-        # ============================================================
-        # 某个标签在公共池中的样本数量可能不足，
-        # 因此实际拿到的数据量有可能小于理论额度。
-        #
-        # 此时只从该客户端允许的 active_labels 中继续补齐，
-        # 不引入新的标签，同时仍保持当前客户端内部不重复。
-        desired_total = train_size + local_test_size
-        current_total = len(selected_train) + len(selected_test)
-        missing = desired_total - current_total
-
-        if missing > 0:
-            fallback_candidates: List[int] = []
-
-            for label in active_labels:
-                fallback_candidates.extend(
-                    idx
-                    for idx in label_to_pool_indices[label]
-                    if idx not in used_by_this_client
-                )
-
-            self.py_rng.shuffle(fallback_candidates)
-
-            # 优先补足训练集。
-            train_missing = max(0, train_size - len(selected_train))
-            take_train = min(train_missing, len(fallback_candidates))
-
-            selected_train.extend(fallback_candidates[:take_train])
-            used_by_this_client.update(fallback_candidates[:take_train])
-
-            fallback_candidates = fallback_candidates[take_train:]
-
-            # 再补足测试集。
-            test_missing = max(0, local_test_size - len(selected_test))
-            take_test = min(test_missing, len(fallback_candidates))
-
-            selected_test.extend(fallback_candidates[:take_test])
-            used_by_this_client.update(fallback_candidates[:take_test])
+        if len(selected_train) + len(selected_test) > total_capacity:
+            raise RuntimeError(
+                "内部错误：客户端实际样本量超过可用容量"
+            )
 
         return selected_train, selected_test
 
@@ -803,7 +817,7 @@ class FLDataDistributor:
         assert self.num_classes is not None
 
         label_preferences = self._generate_client_label_preferences()
-        theoretical_client_sizes = self._generate_client_sizes()
+        requested_client_sizes = self._generate_client_sizes()
 
         # 建立“标签 -> 可用公共样本索引”的映射。
         label_to_pool_indices: Dict[int, List[int]] = defaultdict(list)
@@ -814,6 +828,8 @@ class FLDataDistributor:
         client_train_indices: Dict[int, List[int]] = {}
         client_test_indices: Dict[int, List[int]] = {}
 
+        # 正式变量沿用原名称，但语义严格为“实际持有量”。
+        # 若数据容量不足，后续所有步骤读取的也是实际抽样数量。
         client_train_sizes: List[int] = []
         client_test_sizes: List[int] = []
         client_sizes: List[int] = []
@@ -823,7 +839,7 @@ class FLDataDistributor:
 
         for client_id in range(self.num_clients):
             train_indices, test_indices = self._sample_for_one_client(
-                total_size=theoretical_client_sizes[client_id],
+                total_size=requested_client_sizes[client_id],
                 train_label_probs=label_preferences[client_id],
                 label_to_pool_indices=label_to_pool_indices,
             )
@@ -963,7 +979,7 @@ if __name__ == "__main__":
 
         print(f"Train/Test 重叠样本数: {len(overlap)}")
 
-        # 检查 test 中是否出现 train 未见过的新标签
+        # 检查 train/test 标签集合；极小标签因整数切分可能只落在一侧
         train_labels = set(
             result.client_label_distribution_train[client_id].keys()
         )

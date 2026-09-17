@@ -527,6 +527,32 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import math
 import random
+import time
+
+import contextlib
+import os
+import sys
+
+
+@contextlib.contextmanager
+def _suppress_native_console_output():
+    """Suppress native stdout/stderr briefly for repeated TenSEAL notices."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
 
 import torch
 
@@ -610,13 +636,14 @@ class CKKSTensorChainRecord:
     round_random_factor_h: float
     protected_squared_distance: float
 
-    # CKKS 解密出来的两个展示值。
+    # 兼容既有可视化接口的两个展示字段。
     #
     # decrypted_raw_squared_distance:
-    #   仅 Demo / 对照用途。
+    #   现在直接复用明文数学对照 D，不再额外执行 Demo-only CKKS raw 分支。
+    #   该字段仅为向后兼容；正式协议不向 TS 暴露 D。
     #
     # decrypted_protected_squared_distance:
-    #   正式协议 TS 应获得的值。
+    #   正式协议 TS 通过 CKKS 解密获得的 hD。
     decrypted_raw_squared_distance: float
     decrypted_protected_squared_distance: float
 
@@ -721,6 +748,10 @@ class ByzantineDetectionResult:
     ckks_coeff_mod_bit_sizes: Tuple[int, ...]
     ckks_global_scale: float
 
+    # Step07 性能分析数据。
+    # 仅记录耗时/尺寸等工程信息，不改变 Byzantine 检测结果。
+    profiling_data: Dict[str, Any]
+
     @property
     def distance_visualization_data(self) -> List[Dict[str, Any]]:
         """
@@ -732,8 +763,8 @@ class ByzantineDetectionResult:
             hD
 
         以及 CKKS 解密的：
-            decrypt(D)     -- Demo 对照
-            decrypt(hD)    -- 正式协议
+            raw-reference(D) -- Demo 对照（不再额外 CKKS 解密）
+            decrypt(hD)      -- 正式协议
         """
 
         rows: List[Dict[str, Any]] = []
@@ -1258,30 +1289,36 @@ def _ckks_secure_squared_distance(
     float,
     float,
     Dict[str, List[float]],
+    Dict[str, float],
 ]:
     """
     对一个 Client / Layer / Tensor 完成 CKKS 安全距离计算。
 
     返回：
-        decrypted_raw_D
+        raw_reference_D
         decrypted_hD
         plaintext_raw_D
         plaintext_hD
         chain_plaintext_values
 
     注意：
-        decrypted_raw_D 仅为 Demo 对照。
+        raw_reference_D 直接等于明文数学对照 D，仅用于实验/可视化兼容，
+        不再额外创建 raw CKKS 分支。
 
-        正式协议真正应该返回给 TS 的只有：
+        正式协议真正由 CKKS 解密并返回给 TS 的只有：
             decrypted_hD
     """
 
     _require_tenseal()
+    _profile_total_start = time.perf_counter()
+    _profile: Dict[str, float] = {}
 
     if float(h) <= 0.0:
         raise ValueError(
             "h 必须 > 0"
         )
+
+    _t = time.perf_counter()
 
     server_vectors: Dict[
         str,
@@ -1318,6 +1355,9 @@ def _ckks_secure_squared_distance(
             tensor.reshape(-1).tolist()
         )
 
+    _profile["prepare_server_vectors"] = time.perf_counter() - _t
+    _t = time.perf_counter()
+
     aggregate = (
         preliminary_aggregate_tensor
         .detach()
@@ -1331,10 +1371,14 @@ def _ckks_secure_squared_distance(
             "客户端 Tensor 与初步聚合 Tensor 元素数量不一致。"
         )
 
+    _profile["prepare_aggregate_vector"] = time.perf_counter() - _t
+
     # -------------------------------------------------------------------------
     # 明文数学路径：
     # 只用于数值验证与可视化 preview。
     # -------------------------------------------------------------------------
+
+    _t = time.perf_counter()
 
     omega_ts = torch.tensor(
         server_vectors["TS"],
@@ -1385,6 +1429,8 @@ def _ckks_secure_squared_distance(
         float(h) * plaintext_raw_D
     )
 
+    _profile["plaintext_reference_path"] = time.perf_counter() - _t
+
     # -------------------------------------------------------------------------
     # CKKS 正式路径
     #
@@ -1402,33 +1448,46 @@ def _ckks_secure_squared_distance(
     #   -> Enc(4 theta)
     # -------------------------------------------------------------------------
 
-    encrypted = ts.ckks_vector(
-        context,
-        server_vectors["TS"],
-    )
+    _t = time.perf_counter()
+    with _suppress_native_console_output():
+        encrypted = ts.ckks_vector(
+            context,
+            server_vectors["TS"],
+        )
+    _profile["encrypt_ts"] = time.perf_counter() - _t
 
     # DS1
+    _t = time.perf_counter()
     encrypted += server_vectors["DS1"]
+    _profile["add_ds1"] = time.perf_counter() - _t
 
     # DS2
+    _t = time.perf_counter()
     encrypted += server_vectors["DS2"]
+    _profile["add_ds2"] = time.perf_counter() - _t
 
     # DS3
+    _t = time.perf_counter()
     encrypted += server_vectors["DS3"]
+    _profile["add_ds3"] = time.perf_counter() - _t
 
     # -------------------------------------------------------------------------
     # 4 theta -> theta
     # -------------------------------------------------------------------------
 
+    _t = time.perf_counter()
     encrypted *= (
         1.0 / float(NUM_SERVERS)
     )
+    _profile["divide_by_4"] = time.perf_counter() - _t
 
     # -------------------------------------------------------------------------
     # theta - G
     # -------------------------------------------------------------------------
 
+    _t = time.perf_counter()
     encrypted -= aggregate.tolist()
+    _profile["subtract_preliminary_G"] = time.perf_counter() - _t
 
     # -------------------------------------------------------------------------
     # 逐元素平方：
@@ -1439,47 +1498,43 @@ def _ckks_secure_squared_distance(
     # -------------------------------------------------------------------------
 
     # -------------------------------------------------------------------------
-    # 两条 CKKS 分支：正式协议 + Demo 对照。
+    # 单一 CKKS 正式路径
     #
-    # 重要的工程调整：不再在 square()+sum() 之后额外做 Enc(D) * h。
-    # 那种顺序会把 plaintext multiplication 放在已经消耗过乘法层级的
-    # 密文上，较容易触发 TenSEAL / SEAL 的 scale out of bounds。
+    # 旧实现为了 Demo 同时计算 Enc(D) 与 Enc(hD)，需要对高维 CKKSVector
+    # 做两次 copy。性能分析证明 copy 是绝对瓶颈，因此这里删除 Demo-only
+    # raw CKKS 分支。
     #
-    # 正式协议利用 h > 0：
+    # raw D 已经由上面的明文数学路径得到，仅用于实验/教学/可视化对照；
+    # Byzantine 筛选始终只使用正式 CKKS 路径解密得到的 hD。
     #
-    #   h * D = h * sum(d_i^2)
-    #         = sum((sqrt(h) * d_i)^2)
+    # 正式路径：
+    #   Enc(d)
+    #       -> * sqrt(h)
+    #       -> square
+    #       -> sum
+    #       -> Enc(hD)
+    #       -> TS decrypt
     #
-    # 因而先在差值密文上乘 sqrt(h)，再平方、求和。数学结果仍严格是 hD，
-    # 且 h 从未在解密后才补乘。
-    #
-    # Demo 分支单独保留原始 D，用于可视化。两条分支互不复用已消耗
-    # level 的结果，给核心步骤留出冗余。
+    # 这样不会改变正式协议的数学结果，也不会改变筛选依据。
     # -------------------------------------------------------------------------
 
-    encrypted_raw_branch = encrypted.copy()
-    encrypted_protected_branch = encrypted.copy()
+    raw_reference_D = float(plaintext_raw_D)
 
-    # Demo-only raw D branch.
-    encrypted_raw_D = encrypted_raw_branch.square().sum()
-
-    decrypted_raw_values = encrypted_raw_D.decrypt()
-
-    if not decrypted_raw_values:
-        raise RuntimeError(
-            "CKKS 解密 raw D 得到空结果。"
-        )
-
-    decrypted_raw_D = float(decrypted_raw_values[0])
-
-    # Formal protected branch: Enc(d) * sqrt(h) -> square -> sum = Enc(hD).
     sqrt_h = math.sqrt(float(h))
-    encrypted_protected_branch *= sqrt_h
-    encrypted_protected_D = encrypted_protected_branch.square().sum()
 
+    _t = time.perf_counter()
+    encrypted *= sqrt_h
+    _profile["protected_multiply_sqrt_h"] = time.perf_counter() - _t
+
+    _t = time.perf_counter()
+    encrypted_protected_D = encrypted.square().sum()
+    _profile["protected_square_and_sum"] = time.perf_counter() - _t
+
+    _t = time.perf_counter()
     decrypted_protected_values = (
         encrypted_protected_D.decrypt()
     )
+    _profile["protected_decrypt"] = time.perf_counter() - _t
 
     if not decrypted_protected_values:
         raise RuntimeError(
@@ -1490,6 +1545,7 @@ def _ckks_secure_squared_distance(
         decrypted_protected_values[0]
     )
 
+    _t = time.perf_counter()
     chain_plaintext_values = {
         "TS_after_encrypt_plaintext_equivalent": (
             plain_stage_ts.tolist()
@@ -1511,12 +1567,16 @@ def _ckks_secure_squared_distance(
         ),
     }
 
+    _profile["build_visualization_plaintext"] = time.perf_counter() - _t
+    _profile["total_tensor"] = time.perf_counter() - _profile_total_start
+
     return (
-        decrypted_raw_D,
+        raw_reference_D,
         decrypted_hD,
         plaintext_raw_D,
         plaintext_hD,
         chain_plaintext_values,
+        _profile,
     )
 
 
@@ -1698,6 +1758,7 @@ def detect_byzantine_from_step06(
     coeff_mod_bit_sizes: Sequence[int] = DEFAULT_COEFF_MOD_BIT_SIZES,
     global_scale: float = DEFAULT_GLOBAL_SCALE,
     preview_values_per_tensor: int = DEFAULT_PREVIEW_VALUES,
+    enable_profiling: bool = True,
 ) -> ByzantineDetectionResult:
     """
     Step 07 正式入口。
@@ -1705,6 +1766,7 @@ def detect_byzantine_from_step06(
     只依赖 Step 06 输出，不主动重跑 Step 00~06。
     """
 
+    _step07_total_start = time.perf_counter()
     _require_tenseal()
     _validate_masking_result(
         masking_result
@@ -1737,11 +1799,13 @@ def detect_byzantine_from_step06(
     # 1. 初步聚合
     # -------------------------------------------------------------------------
 
+    _t = time.perf_counter()
     preliminary_aggregate = (
         build_preliminary_aggregate(
             masked_by_server
         )
     )
+    _preliminary_aggregate_seconds = time.perf_counter() - _t
 
     # -------------------------------------------------------------------------
     # 2. 本轮唯一 h > 0
@@ -1758,6 +1822,7 @@ def detect_byzantine_from_step06(
     # 3. CKKS Context
     # -------------------------------------------------------------------------
 
+    _t = time.perf_counter()
     context = create_ckks_context(
         poly_modulus_degree=(
             poly_modulus_degree
@@ -1767,6 +1832,12 @@ def detect_byzantine_from_step06(
         ),
         global_scale=global_scale,
     )
+    _context_creation_seconds = time.perf_counter() - _t
+
+    # Step07 profiling accumulators.
+    # 必须在进入 client/layer/tensor 循环之前初始化。
+    _ckks_stage_totals: Dict[str, float] = {}
+    _tensor_profile_rows: List[Dict[str, Any]] = []
 
     raw_squared_distances: Dict[
         str,
@@ -1877,11 +1948,12 @@ def detect_byzantine_from_step06(
                 }
 
                 (
-                    decrypted_raw_D,
+                    raw_reference_D,
                     decrypted_hD,
                     plaintext_raw_D,
                     plaintext_hD,
                     chain_plaintext_values,
+                    tensor_profile,
                 ) = _ckks_secure_squared_distance(
                     context=context,
                     masked_tensors_by_server=(
@@ -1895,6 +1967,32 @@ def detect_byzantine_from_step06(
                         ]
                     ),
                     h=h,
+                )
+
+                for _stage_name, _seconds in tensor_profile.items():
+                    _ckks_stage_totals[_stage_name] = (
+                        _ckks_stage_totals.get(_stage_name, 0.0)
+                        + float(_seconds)
+                    )
+
+                _tensor_profile_rows.append(
+                    {
+                        "client_id": int(client_id),
+                        "layer_name": str(layer_name),
+                        "tensor_index": int(tensor_index),
+                        "tensor_role": _tensor_role(
+                            tensor_index=tensor_index,
+                            tensor_count=len(ts_tensors),
+                        ),
+                        "num_values": int(ts_tensor.numel()),
+                        "seconds": float(
+                            tensor_profile["total_tensor"]
+                        ),
+                        "stages": {
+                            str(k): float(v)
+                            for k, v in tensor_profile.items()
+                        },
+                    }
                 )
 
                 # -------------------------------------------------------------
@@ -1934,7 +2032,7 @@ def detect_byzantine_from_step06(
                 ][
                     int(tensor_index)
                 ] = float(
-                    decrypted_raw_D
+                    raw_reference_D
                 )
 
                 decrypted_protected_squared_distances[
@@ -2042,7 +2140,7 @@ def detect_byzantine_from_step06(
                         ),
 
                         decrypted_raw_squared_distance=float(
-                            decrypted_raw_D
+                            raw_reference_D
                         ),
 
                         decrypted_protected_squared_distance=float(
@@ -2050,7 +2148,7 @@ def detect_byzantine_from_step06(
                         ),
 
                         raw_distance_abs_error=abs(
-                            float(decrypted_raw_D)
+                            float(raw_reference_D)
                             - float(plaintext_raw_D)
                         ),
 
@@ -2068,6 +2166,8 @@ def detect_byzantine_from_step06(
     #   正式筛选依据使用 CKKS 解密的 hD，
     #   而不是明文数学真值。
     # -------------------------------------------------------------------------
+
+    _filtering_start = time.perf_counter()
 
     component_summaries: List[
         ComponentFilteringSummary
@@ -2181,6 +2281,88 @@ def detect_byzantine_from_step06(
                 summary.rejected_clients.copy()
             )
 
+    _filtering_seconds = time.perf_counter() - _filtering_start
+    _step07_total_seconds = time.perf_counter() - _step07_total_start
+
+    profiling_data: Dict[str, Any] = {
+        "step07_total_seconds": float(_step07_total_seconds),
+        "preliminary_aggregate_seconds": float(
+            _preliminary_aggregate_seconds
+        ),
+        "ckks_context_creation_seconds": float(
+            _context_creation_seconds
+        ),
+        "filtering_seconds": float(_filtering_seconds),
+        "ckks_stage_totals": {
+            str(k): float(v)
+            for k, v in _ckks_stage_totals.items()
+        },
+        "tensor_profiles": _tensor_profile_rows,
+        "num_ckks_tensor_jobs": len(_tensor_profile_rows),
+        "total_ckks_values_processed": sum(
+            int(row["num_values"])
+            for row in _tensor_profile_rows
+        ),
+    }
+
+    if enable_profiling:
+        print("\n" + "=" * 96)
+        print("Step 07 Internal Performance Profile")
+        print("=" * 96)
+        print(
+            f"Preliminary aggregate : "
+            f"{_preliminary_aggregate_seconds:10.3f} s"
+        )
+        print(
+            f"CKKS context + keys   : "
+            f"{_context_creation_seconds:10.3f} s"
+        )
+
+        print("\nCKKS stage totals (all Client/Layer/Tensor jobs):")
+        for _stage_name, _seconds in sorted(
+            _ckks_stage_totals.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            if _stage_name == "total_tensor":
+                continue
+            print(
+                f"  {_stage_name:<32}: "
+                f"{_seconds:10.3f} s"
+            )
+
+        print("\nSlowest Tensor jobs:")
+        for _row in sorted(
+            _tensor_profile_rows,
+            key=lambda row: row["seconds"],
+            reverse=True,
+        )[:15]:
+            print(
+                f"  Client {_row['client_id']:02d} | "
+                f"{_row['layer_name']:<7} | "
+                f"{_row['tensor_role']:<6} | "
+                f"values={_row['num_values']:>7d} | "
+                f"{_row['seconds']:10.3f} s"
+            )
+
+        print(
+            f"\nFiltering             : "
+            f"{_filtering_seconds:10.3f} s"
+        )
+        print(
+            f"CKKS Tensor jobs       : "
+            f"{len(_tensor_profile_rows)}"
+        )
+        print(
+            f"Values processed       : "
+            f"{profiling_data['total_ckks_values_processed']}"
+        )
+        print(
+            f"STEP07 TOTAL           : "
+            f"{_step07_total_seconds:10.3f} s"
+        )
+        print("=" * 96)
+
     return ByzantineDetectionResult(
         round_index=round_index,
         master_seed=master_seed,
@@ -2241,6 +2423,7 @@ def detect_byzantine_from_step06(
         ckks_global_scale=float(
             global_scale
         ),
+        profiling_data=profiling_data,
     )
 
 
@@ -2395,6 +2578,12 @@ if __name__ == "__main__":
     )
     print(
         "=" * 96
+    )
+
+    # Main calls Step07 once per FL round: show one concise notice per round.
+    print(
+        "[Step 07] CKKS: oversized vectors may span multiple ciphertexts; "
+        "repeated warnings suppressed this round."
     )
 
     if ts is None:
@@ -2611,6 +2800,7 @@ if __name__ == "__main__":
         h_min=0.5,
         h_max=2.0,
         preview_values_per_tensor=3,
+        enable_profiling=True,
     )
 
     print_byzantine_detection_result(
@@ -2791,6 +2981,96 @@ if __name__ == "__main__":
         next_round_h
         != result.round_random_factor_h,
     )
+
+    # -------------------------------------------------------------------------
+    # 10. 可选：代表性大 Tensor CKKS 微基准
+    #
+    # 默认关闭，因为 69120 个参数正是当前 CIFAR fc1.weight 的典型大 Tensor，
+    # 在你的机器上可能需要较长时间。
+    #
+    # 若要单独测它，不需要跑完整 FL：
+    #
+    # Windows CMD:
+    #   set STEP07_LARGE_BENCHMARK=1
+    #   python Step_07_V_byzantine_final_profiled.py
+    #
+    # PowerShell:
+    #   $env:STEP07_LARGE_BENCHMARK="1"
+    #   python Step_07_V_byzantine_final_profiled.py
+    # -------------------------------------------------------------------------
+    import os
+
+    if os.environ.get("STEP07_LARGE_BENCHMARK") == "1":
+        print("\n" + "=" * 96)
+        print("Optional Large-Tensor CKKS Benchmark")
+        print("=" * 96)
+
+        large_num_values = 69120
+        g = torch.Generator(device="cpu")
+        g.manual_seed(20260917)
+
+        theta = torch.randn(
+            large_num_values,
+            generator=g,
+            dtype=torch.float64,
+        )
+        r_ts = torch.randn(
+            large_num_values,
+            generator=g,
+            dtype=torch.float64,
+        )
+        r_ds1 = torch.randn(
+            large_num_values,
+            generator=g,
+            dtype=torch.float64,
+        )
+        r_ds2 = torch.randn(
+            large_num_values,
+            generator=g,
+            dtype=torch.float64,
+        )
+        r_ds3 = -(r_ts + r_ds1 + r_ds2)
+
+        large_masked = {
+            "TS": theta + r_ts,
+            "DS1": theta + r_ds1,
+            "DS2": theta + r_ds2,
+            "DS3": theta + r_ds3,
+        }
+
+        # 用轻微偏移的 G，保证距离非零。
+        large_G = theta + 0.001
+
+        print(f"Tensor values: {large_num_values}")
+        print("Creating one CKKS context...")
+        t0 = time.perf_counter()
+        bench_context = create_ckks_context()
+        print(
+            f"Context + keys: "
+            f"{time.perf_counter() - t0:.3f} s"
+        )
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            large_profile,
+        ) = _ckks_secure_squared_distance(
+            context=bench_context,
+            masked_tensors_by_server=large_masked,
+            preliminary_aggregate_tensor=large_G,
+            h=1.25,
+        )
+
+        print("\nLarge Tensor stage timing:")
+        for name, seconds in sorted(
+            large_profile.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            print(f"  {name:<32}: {seconds:10.3f} s")
 
     print(
         "\n提示：以上测试只会在直接运行本文件时执行；"

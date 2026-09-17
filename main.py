@@ -1119,8 +1119,8 @@ if __name__ == "__main__":
     config = ExperimentConfig(
         # 全局
         master_seed=42,
-        num_rounds=2,
-        num_clients=10,
+        num_rounds=10,
+        num_clients=20,
         dataset_name="cifar10",
         data_dir="./data",
         device=(
@@ -1152,8 +1152,8 @@ if __name__ == "__main__":
         consistent_shared_layers=3,
 
         # Local training
-        personalized_epochs=1,
-        shared_epochs=1,
+        personalized_epochs=2,
+        shared_epochs=2,
         learning_rate=0.01,
         momentum=0.9,
         train_batch_size=64,
